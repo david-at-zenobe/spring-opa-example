@@ -25,20 +25,39 @@ service. Rough trade-offs:
 
 | | OPA sidecar | AWS Verified Permissions | Central authz service (custom) |
 |---|---|---|---|
-| **Latency** | Localhost call, in-memory eval — sub-ms | Network call to AWS per decision | Network call per decision |
-| **Availability** | Fails only if the pod/sidecar dies | Coupled to AVP/AWS availability | Coupled to that service's uptime; becomes a SPOF |
-| **Ops footprint** | One extra container per pod, pulling a config/bundle it already knows how to poll for | None — fully managed | You build and run everything yourself (HA, scaling, deploys) |
-| **Policy language** | Rego — flexible, general-purpose, a bit more to learn | Cedar — simpler, formally verifiable, less expressive | Whatever you write — no policy/data separation by default |
-| **Vendor lock-in** | None, open source | AWS only | None, but bespoke |
-| **Data freshness** | As fresh as your bundle push (see below) | Data pushed into AVP's policy store — same class of problem | Whatever you build — often just a live DB query |
+| **Latency** | Localhost call, in-memory eval — sub-ms | One network call to AWS per decision | **Two** network hops per decision: app -> central service -> AVP |
+| **Availability** | Fails only if the pod/sidecar dies | Coupled to AVP/AWS availability | Coupled to *both* the central service's uptime *and* AVP's — and every service in the org calls through it |
+| **Ops footprint** | One extra container per pod, pulling a config/bundle it already knows how to poll for | None — fully managed | You build and run everything yourself (HA, scaling, deploys) — on top of the AVP calls it still has to make |
+| **Policy language** | Rego — flexible, general-purpose, a bit more to learn | Cedar — simpler, formally verifiable, less expressive | Whatever you write, but decisions still ultimately live in AVP/Cedar |
+| **Vendor lock-in** | None, open source | AWS only | AWS, plus a bespoke service on top of it |
+| **Data freshness** | As fresh as your bundle push (see below) | Data pushed into AVP's policy store — same class of problem | Same problem again, one layer further removed |
 | **Maturity/tooling** | Widely adopted OSS, well-documented | Native AWS console/IAM integration | None — you build it |
 
-All three are workable. AVP trades a bit of latency and flexibility for "someone else runs it," and a
-custom service gives full control at the cost of building an entire policy engine yourselves. OPA
-sits in the middle in a way that suits us well here: it's a single extra sidecar container (not a
+AVP on its own is a reasonable, fully-managed option that trades a bit of latency and flexibility for
+"someone else runs it." OPA sits alongside it well here: it's a single extra sidecar container (not a
 fleet to operate), it keeps decisions local and fast, and it's a well-trodden pattern — Netflix and
 several other large platforms run OPA as their authorization layer at far greater scale than we need.
-Given our latency and dataset size, it's a reasonable default rather than a big bet.
+
+**The central authz service, as currently proposed, is worth a harder look.** It isn't really a third
+option — it's a thin, stateful wrapper *around* AVP. That means every decision pays for a hop to the
+central service and then a hop from there to AVP, and in practice this pattern tends to get called
+once per resource being checked rather than once per client request (an N+1: list 50 chargers, make
+50 authz calls), so the two-hop cost compounds fast. It also concentrates risk: it becomes a **single
+point of failure that every service in the org depends on**, and that single point of failure itself
+depends on AVP being up — so either layer having a bad day takes down authorization everywhere, for
+everyone, at once. A sidecar (OPA) or a direct SDK call (AVP) both avoid that shared critical path by
+design; a hand-built proxy in front of a managed service gets the downsides of both without the
+upside of either.
+
+**A separate concern: the proposal to have the authz service return a decision as a plain-text
+header, which downstream services then read and trust.** That's an unsigned, easily forged value —
+any caller or intermediary can set that header directly, so a downstream service "trusting" it is
+trusting whoever is closest to it on the wire, not the authz service. That's the opposite of zero
+trust, and it only takes one service skipping re-verification to turn it into a privilege-escalation
+path. If a decision genuinely needs to be forwarded rather than re-checked, it should be a short-lived,
+signed token (e.g. a JWT the authz service signs and each recipient verifies), not a plain header. The
+sidecar model sidesteps this entirely — each service calls its own local OPA and gets its own decision,
+so there's nothing forwarded to spoof.
 
 ## Data scale
 
