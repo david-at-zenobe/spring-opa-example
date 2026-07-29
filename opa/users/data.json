@@ -1,0 +1,9 @@
+{
+  "users": {
+    "revision": "1",
+    "entries": {
+      "alice": { "org": "acme-corp" },
+      "bob": { "org": "globex" }
+    }
+  }
+}
